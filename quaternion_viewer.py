@@ -158,10 +158,12 @@ HEAD_AXES = {
     # 2026-09-14, MN8-A001 calibrated on a head (one wearer, one fit): the earbud's sensor is
     # rotated ~37° off the axes, so a turn is −0.80Y −0.57X. Fit varies — still Calibrate per wearer.
     "MN8": ((0.820, -0.564, 0.098), (0.027, 0.210, 0.977), (-0.572, -0.799, 0.187)),
-    # 2026-09-14, EPOCX-E5020FF0: the band pivots at the ears, so its two positions put the
-    # sensor ~82° apart about the ear-to-ear axis — turn and tilt trade places. One row set per fit.
-    "EPOCX:horizontal": ((-0.242, -0.970, 0.034), (0.062, 0.019, 0.998), (-0.968, 0.244, 0.055)),
-    "EPOCX:vertical": ((-0.992, 0.095, 0.078), (0.071, -0.079, 0.994), (0.101, 0.992, 0.072)),
+    # The EPOC X band pivots at the ears, so its two positions put the sensor ~82° apart about
+    # the ear-to-ear axis — turn and tilt trade places. One row set per fit. Average of two
+    # units calibrated on a head (2026-09-14/15), which agreed within 7.6° (horizontal) and
+    # 9.9° (vertical); each sits within 5° of these rows.
+    "EPOCX:horizontal": ((-0.188, -0.982, 0.021), (0.026, 0.016, 1.000), (-0.982, 0.189, 0.023)),
+    "EPOCX:vertical": ((-0.981, 0.178, 0.082), (0.072, -0.060, 0.996), (0.182, 0.982, 0.046)),
 }
 HEAD_ORDER = ("roll", "pitch", "yaw")
 FULLY_MEASURED = {"INSIGHT", "MN8", "EPOCX:horizontal", "EPOCX:vertical"}  # checked on a head
@@ -304,6 +306,98 @@ class GestureDetector:
 
 
 GESTURE_LABELS = {"nod": "nod · yes", "shake": "shake · no", "wobble": "wobble"}
+
+
+# ── yaw drift ────────────────────────────────────────────────────────────────
+
+def quat_about_z(angle):
+    return (math.cos(angle / 2), 0.0, 0.0, math.sin(angle / 2))
+
+
+class YawDriftCorrector:
+    """Removes the slow, steady yaw creep of a heading nothing anchors.
+
+    Pitch and roll are held by gravity, but heading needs a magnetometer. MN8 has none, so
+    a tiny constant gyroscope error integrates into a steady turn: a still head recorded on
+    MN8 read −1.05°/s for 79 s (2° off a straight line). A deadband would swallow slow real
+    turns and still pass faster drift. Instead:
+
+      * while the head is confirmed still, yaw is held where it was — whatever it does
+        then is drift, by definition;
+      * each still stretch's yaw slope (least squares) teaches the drift RATE, which keeps
+        being subtracted while the head moves.
+
+    Speeds are measured over RATE_WINDOW, not sample to sample, so sensor jitter at 32/64 Hz
+    can't fake motion. A steady turn slower than QUIET_RATE is indistinguishable from drift
+    and gets cancelled too
+    — so this can be switched off in the app. Drift was seen on MN8 (no magnetometer) and
+    reported on other headsets too, so it is on for every headset by default. See README,
+    "Yaw drift".
+    """
+
+    QUIET_RATE = 3.0    # °/s: every axis (yaw after removing learned drift) below this = still
+    QUIET_TIME = 1.0    # s of continuous stillness before yaw is held
+    RATE_WINDOW = 0.6   # s over which speeds are measured
+    LEARN_TIME = 20.0   # s of one still stretch after which its slope fully replaces the estimate
+    MIN_STRETCH = 3.0   # s of stillness before its slope is trusted at all
+    MAX_RATE = 3.0      # °/s: never believe a larger drift than this
+
+    def __init__(self):
+        self.rate = 0.0  # learned drift, °/s — a property of the sensor, kept across resets
+        self.reset()
+
+    def reset(self):
+        """New neutral pose: the accumulated correction starts over; the learned rate stays."""
+        self.offset = 0.0
+        self.unwrapped = None
+        self.last_t = None
+        self.window = collections.deque()  # (t, roll, pitch, yaw) over RATE_WINDOW
+        self.quiet_since = None
+        self.held = None                   # corrected yaw kept while still
+        self.stretch = None                # running least-squares sums of the still stretch
+
+    @property
+    def holding(self):
+        return self.held is not None
+
+    def update(self, t, rel):
+        """Feed one new head-frame rotation; returns it with the drift removed."""
+        angles = [math.degrees(a) for a in euler_from_quat(rel)]
+        if self.unwrapped is None:
+            self.unwrapped = angles
+        else:
+            self.unwrapped = [u + (a - u + 180) % 360 - 180 for a, u in zip(angles, self.unwrapped)]
+        roll, pitch, yaw = self.unwrapped
+        dt = t - self.last_t if self.last_t is not None and t > self.last_t else 0.0
+        self.last_t = t
+
+        self.window.append((t, roll, pitch, yaw))
+        while len(self.window) > 2 and t - self.window[1][0] >= self.RATE_WINDOW:
+            self.window.popleft()
+        t0, r0, p0, y0 = self.window[0]
+        span = t - t0
+        still = span >= 0.5 * self.RATE_WINDOW and all(abs(v) < self.QUIET_RATE for v in (
+            (roll - r0) / span, (pitch - p0) / span, (yaw - y0) / span - self.rate))
+        self.quiet_since = (self.quiet_since if self.quiet_since is not None else t) if still else None
+
+        if self.quiet_since is not None and t - self.quiet_since >= self.QUIET_TIME:
+            if self.held is None:  # stillness just confirmed: hold yaw here, start a new stretch
+                self.held = yaw - self.offset
+                self.stretch = {"t0": t, "rate0": self.rate, "n": 0, "st": 0.0, "sy": 0.0, "stt": 0.0, "sty": 0.0}
+            self.offset = yaw - self.held
+            s = self.stretch
+            x = t - s["t0"]
+            s["n"] += 1; s["st"] += x; s["sy"] += yaw; s["stt"] += x * x; s["sty"] += x * yaw
+            den = s["n"] * s["stt"] - s["st"] ** 2
+            if x >= self.MIN_STRETCH and den > 1e-9:
+                slope = (s["n"] * s["sty"] - s["st"] * s["sy"]) / den
+                weight = min(1.0, x / self.LEARN_TIME)
+                rate = s["rate0"] + (slope - s["rate0"]) * weight
+                self.rate = max(-self.MAX_RATE, min(self.MAX_RATE, rate))
+        else:
+            self.held = None
+            self.offset += self.rate * dt
+        return quat_normalize(quat_mul(quat_about_z(math.radians(-self.offset)), rel))
 
 
 # ── Cortex ───────────────────────────────────────────────────────────────────
@@ -642,6 +736,7 @@ class App:
         self.recent_quats = collections.deque(maxlen=600)  # (cortex time, sensor quaternion)
         self.cal_neutral, self.cal_moves, self.cal_gravity = None, {}, None
         self.gestures = GestureDetector()  # counts start over per headset
+        self.drift = YawDriftCorrector()   # learned drift starts over per headset
         self.cal_returned = False
 
     # ── widgets ──
@@ -683,6 +778,11 @@ class App:
         self.protocol_btn = self._button(tools, "Test protocol", self._on_protocol)
         self.protocol_btn.pack(side="left", padx=(0, 8))
         self._button(tools, "Export log", self._on_export).pack(side="left", padx=(0, 12))
+        self.drift_fix = tk.BooleanVar(value=True)
+        tk.Checkbutton(tools, text="Hold yaw when still (drift fix)", variable=self.drift_fix,
+                       command=self._on_drift_toggle, bg=BG, fg=DIM, selectcolor=CARD, activebackground=BG,
+                       activeforeground=TEXT, font=(SANS, 9), bd=0, highlightthickness=0,
+                       cursor="hand2").pack(side="left", padx=(0, 12))
         tk.Label(tools, text=f"logging to logs/{os.path.basename(self.log.path)}", bg=BG, fg=FAINT,
                  font=(MONO, 8)).pack(side="left")
 
@@ -803,7 +903,7 @@ class App:
         return f"{self.headset_id} ({self.fit} band)" if self.fit else self.headset_id
 
     def _apply_setup(self, lead=""):
-        """Load the axes for this headset + band position; calibrate first if none are saved."""
+        """Load the axes for this headset + band position. Calibration only runs when asked."""
         self.axes, self.axes_source = self._axes_for(self.headset_id, self.fit)
         self.axes_measured = self.axes_source != "guess"
         self.log.write("setup", headset=self.headset_id, fit=self.fit, axes_source=self.axes_source,
@@ -817,9 +917,15 @@ class App:
                              "Press Calibrate to redo it.", OK)
         elif not any(k in self.cols for k in QUAT):
             self._set_status(f"{lead}Streaming motion from {self.headset_id}.", OK)
-        else:
-            # first time on this headset + fit: measure its axes before trusting the words
-            self._calibration_advance("forward", lead=f"{lead}First use of {self._setup_name()}.{band_hint}  ")
+        elif self.axes_source == "family":
+            self._set_status(f"{lead}Using a calibration from another {headset_family(self.headset_id)} headset.{band_hint}  "
+                             "Press Calibrate to fit it to you.", OK)
+        elif self.axes_source == "default":
+            self._set_status(f"{lead}Using the built-in {headset_family(self.headset_id)} axes, measured on real heads."
+                             f"{band_hint}  Press Calibrate to fit them to you.", OK)
+        else:  # no measurement for this headset type yet
+            self._set_status(f"{lead}No measured axes for {headset_family(self.headset_id)} headsets yet, so directions "
+                             f"may be wrong.{band_hint}  Press Calibrate to measure them.", ACCENT)
 
     def _on_pick_headset(self, _event=None):
         i = self.headset_box.current()
@@ -908,6 +1014,7 @@ class App:
         self.axes, self.axes_measured = axes_from_moves(turn, nod), True
         self.neutral, self.shown, self.prev_euler = self.cal_neutral, None, None
         self.gestures.reset()
+        self.drift.reset()
         self._save_calibration(self.headset_id, self.fit, self.axes, self.cal_gravity)
         yaw_off = math.degrees(math.acos(min(1.0, max(abs(c) for c in self.axes[2]))))
         summary = "  ·  ".join(f"{name} = {describe_axis(row)}" for name, row in zip(("tilt", "nod", "turn"), self.axes))
@@ -985,6 +1092,13 @@ class App:
         self.prev_euler = None
         self.gestures.reset()
         self.log.write("zero_pose")
+
+    def _on_drift_toggle(self):
+        on = self.drift_fix.get()
+        self.log.write("drift_fix", on=on, learned_rate=round(self.drift.rate, 3))
+        self._on_zero()  # switching changes what "forward" means; start again from the current pose
+        self._set_status("Drift fix on: yaw is held while your head is still." if on else
+                         "Drift fix off: raw yaw from the headset, drift included.", OK)
 
     def _on_close(self):
         cx, self.cortex = self.cortex, None
@@ -1175,7 +1289,9 @@ class App:
                              "Press Export log and send it anyway — the headset settings are in it.", ERROR)
         if now - self.last_rate_log > 5:
             self.last_rate_log = now
-            self.log.write("rate", headset=self.headset_id, hz=round(self.hz, 2) if self.hz else None, samples=self.seq)
+            self.log.write("rate", headset=self.headset_id, hz=round(self.hz, 2) if self.hz else None, samples=self.seq,
+                           drift_fix=self.drift_fix.get(), drift_rate=round(self.drift.rate, 3),
+                           yaw_held=self.drift.holding)
 
     def _handle(self, kind, payload):
         if kind in ("error", "connect_failed", "lost"):
@@ -1274,10 +1390,16 @@ class App:
             q = quat_normalize(q)
             if is_new and self.calibration:
                 self._calibration_sample(t, q)
+            fresh = is_new
             if self.neutral is None:
                 self.neutral = q
                 self.shown = None
-            self.rel = to_head_frame(quat_normalize(quat_mul(quat_conj(self.neutral), q)), self.axes)
+                self.drift.reset()
+                fresh = True  # recompute against the new neutral even without a new sample
+            if fresh:  # the drift corrector integrates over time, so feed each sample exactly once
+                rel = to_head_frame(quat_normalize(quat_mul(quat_conj(self.neutral), q)), self.axes)
+                use_fix = self.drift_fix.get() and not self.calibration
+                self.rel = self.drift.update(t, rel) if use_fix else rel
             # Ease toward the newest pose so slow streams (MN8 sends 6.4 Hz) don't jump.
             self.shown = self.rel if self.shown is None else nlerp(self.shown, self.rel, 0.35)
 
@@ -1401,6 +1523,13 @@ class App:
         fastest = self._fastest_axis() if self.streaming and self.rel is not None and self.hz else None
         axis = "—" if fastest is None else describe_axis(self.axes[fastest], smallest=0.3)
         c.create_text(hx, hy + 126, fill=FAINT, font=(MONO, 9), text=f"sensor axis {axis}")
+        if not self.drift_fix.get():
+            drift_text = "drift fix off"
+        elif not self.streaming or self.rel is None:
+            drift_text = ""
+        else:
+            drift_text = f"yaw drift {self.drift.rate:+.2f}°/s" + ("  · held" if self.drift.holding else "")
+        c.create_text(hx, hy + 142, fill=FAINT, font=(MONO, 9), text=drift_text)
 
         # bars
         lx, tx0, tx1 = 232, 286, W - 32

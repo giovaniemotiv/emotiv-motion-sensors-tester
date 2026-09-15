@@ -28,10 +28,13 @@ records logs so headsets you don't own can be tested remotely.
 - **Connects to Cortex:** pick a headset and see its motion right away.
 - **Live display:** a head drawing that turns, nods and leans with you; pitch / yaw / roll in
   degrees; bars for Q0–Q3 and the accelerometer / magnetometer; the measured sample rate.
-- **Calibration:** five short holds (forward, up, down, left, right) measure how the sensor
-  sits on *this* head. The result is saved per headset, and per band position for EPOC X.
+- **Built-in head axes** for Insight 2, MN8 and EPOC X (both band positions), measured on real
+  heads, so motion reads correctly without any setup.
+- **Optional calibration:** five short holds (forward, up, down, left, right) measure how the
+  sensor sits on *your* head. The result is saved per headset, and per band position for EPOC X.
 - **Gesture detection:** nod (yes), headshake (no) and head wobble (ear toward alternate
   shoulders), with counters.
+- **Yaw drift fix:** stops the heading slowly creeping while your head is still.
 - **Test protocol:** a guided ~2-minute recording with labelled steps, for checking gesture
   detection on a real head.
 - **Session logs** of every raw sample and event, with a one-click **Export log** zip to send.
@@ -81,14 +84,20 @@ the app and the fields fill in by themselves:
    headsets, which can take up to ~20 s; **Rescan** starts a new scan.
 3. **Band** (EPOC X only): choose *horizontal* or *vertical* to match how you wear it. Each
    position has its own calibration, and the app remembers your last choice per headset.
-4. **Calibration** runs by itself the first time you use a headset (or band position). Follow
-   the prompts under the buttons, returning to face the screen before each move:
+4. **Calibration (optional)** only runs when you press **Calibrate**. Without it, the app uses
+   the built-in axes for your headset type; the status line says which axes are in use.
+   Calibrating fits them to how the headset sits on your head, and is recommended for
+   headsets with no built-in axes yet (such as EPOC Flex). Follow the prompts under the
+   buttons, returning to face the screen before each move:
    face forward and hold still → look **up** → look **down** → turn **left** → turn **right**.
-   Hold each position about a second; it advances by itself. Press **Calibrate** to redo it anytime.
+   Hold each position about a second; it advances by itself.
 5. **Watch.** The word under the head says *still*, *turning*, *nodding* or *tilting*. It turns
    green during a gesture (*nod · yes*, *shake · no*, *wobble*), and the gesture counters
    update. *sensor axis* shows which raw sensor axis you are rotating about.
 6. **Zero pose** makes your current head position the new "forward".
+7. **Hold yaw when still (drift fix)**, on by default, stops yaw slowly creeping while you
+   don't move. The line under the head shows the drift it has learned, and `held` while it
+   is holding yaw. Turn it off to see the headset's raw yaw. See [Yaw drift](#7-yaw-drift).
 
 ### Test protocol and sending a log
 
@@ -156,9 +165,9 @@ One JSON object per line. Every line has `type` and `t_local` (computer time, se
 | `subscribe` | Subscription result: the stream's column names (`cols`) and any failure |
 | `setup` | Axes used, and where they came from (`saved`, `family`, `default`, `guess`) |
 | `mot` | One motion sample: `t` (Cortex time) and `v` (raw values, in `cols` order) |
-| `rate` | Measured sample rate, every 5 s |
+| `rate` | Every 5 s: measured sample rate, whether the drift fix is on, learned drift (°/s), whether yaw is being held |
 | `calibration_step`, `calibration`, `calibration_failed` | Each step; the result with raw moves, neutral pose and gravity |
-| `fit`, `zero_pose` | Band changes; Zero pose presses |
+| `fit`, `zero_pose`, `drift_fix` | Band changes; Zero pose presses; drift fix switched on/off |
 | `gesture` | A detected nod / shake / wobble |
 | `marker` | Test protocol: `protocol_start`, `step_start:<step>`, `step_end:<step>`, `protocol_end` (gestures per step) |
 | `warning`, `error`, `lost`, `no_data` | Cortex warnings, errors, disconnects; no samples 5 s after subscribing |
@@ -225,20 +234,26 @@ app **measures** it:
 In a simulation with a sensor tilted 25° and deliberately imprecise moves, a 40° right turn
 read as (roll −10°, pitch 13°, yaw 36°) before calibration and (4°, −1°, 40°) after.
 
-Built-in starting points, measured on real heads with this calibration (one unit each):
+Built-in axes, measured on real heads with this calibration. Insight 2 and MN8 come from one unit
+each. EPOC X is the average of two units, which agreed within 7.6° (horizontal) and 9.9°
+(vertical); each unit is within 5° of the average:
 
 | Headset | Turn (yaw) | Nod (pitch) | Lean (roll) | Sensor offset |
 |---|---|---|---|---|
 | Insight 2 | −X | +Z | −Y | 7–11° |
 | MN8 | −0.80Y −0.57X | +0.98Z | +0.82X −0.56Y | ~37° (earbud sits at an angle) |
-| EPOC X, band horizontal | −X | +Z | −Y | 4–15° |
-| EPOC X, band vertical | +Y | +Z | −X | 6–7° |
+| EPOC X, band horizontal | −0.98X +0.19Y | +1.00Z | −0.98Y −0.19X | 2–11° |
+| EPOC X, band vertical | +0.98Y +0.18X | +1.00Z | −0.98X +0.18Y | 5–11° |
 
 The EPOC X band pivots at the ears, so switching position rotates the sensor ~82° about the
 ear-to-ear axis. Nodding is unaffected, but turning and leaning swap; worn vertical with the
-horizontal setup, a turn reads as a lean. Earbud fit varies from person to person, so a
-calibration always replaces the built-in values. Headsets without a built-in entry (for
-example EPOC Flex) calibrate on first use.
+horizontal setup, a turn reads as a lean.
+
+The app uses, in order: **your own calibration** for that headset (and band position); else the
+latest calibration of **another headset of the same type** saved on this computer; else the
+**built-in axes** above. Headsets without built-in axes (for example EPOC Flex) fall back to
+the Insight axes and say so in the status line, so press **Calibrate** on them. Earbud fit
+varies from person to person, so calibrating is worth it on MN8 too.
 
 ### 4. Gestures
 
@@ -288,6 +303,42 @@ No 3D engine, just a Tkinter canvas redrawn ~30 times a second:
   slides over the face as you turn.
 - **The drawing is a mirror image:** turn left, and its nose moves toward the left of the screen.
 
+### 7. Yaw drift
+
+Pitch and roll are anchored by gravity, but heading (yaw) needs a magnetometer as a
+reference. Without one, a tiny constant gyroscope error adds up to a steady turn. On a
+recording of an MN8 on a still head, yaw moved **−79° in 79 s** (−1.05°/s), staying within 2° of a
+straight line. The same creep has been reported on other headsets too.
+
+A simple threshold ("ignore slow changes") would also swallow slow real turns, and still let
+through drift faster than the threshold. The drift fix works differently:
+
+1. **Speeds are measured over 0.6 s**, not sample to sample, so sensor jitter at 32/64 Hz can't
+   look like motion.
+2. When every axis has moved slower than **3°/s** for **1 s**, the head counts as still, and
+   **yaw is held** where it was. Anything yaw does while the head is still is drift.
+3. Each still stretch teaches the **drift rate**: a straight-line fit of the raw yaw, trusted
+   after 3 s and fully after 20 s, capped at 3°/s. That rate keeps being subtracted while the
+   head moves, so looking around doesn't bring the drift back.
+4. Zero pose, calibration and changing headset or band start the correction over. The
+   learned rate is kept for the same headset.
+
+Measured with simulated 1.05°/s drift, at 6.4 and 32 Hz (degrees off at the end):
+
+| Scenario | Without fix | With fix |
+|---|---|---|
+| Still for 120 s | 126° | 1.3–1.6° |
+| Look around for 40 s, then still | 105° | 4–5° |
+| Headshakes, then still | 63° | 2° |
+| Turn 30° at 4, 8 or 20°/s | 75–81° | 2–3.5° |
+| Turn 30° at 1–2°/s | 89–105° | ~31° (turn cancelled) |
+
+On the real MN8 recording, replayed through the app, yaw stayed between −2° and +1° with the
+fix on (−84° with it off).
+
+**The trade-off:** without a heading reference, a steady turn slower than 3°/s looks exactly
+like drift, so the fix cancels it. Turn the fix off when you need very slow turns.
+
 ## Supported headsets
 
 The app adapts to whatever columns Cortex returns.
@@ -295,7 +346,7 @@ The app adapts to whatever columns Cortex returns.
 | Headset | Motion stream (as reported by Cortex) | Notes |
 |---|---|---|
 | Insight / Insight 2 | Q0–Q3, ACC, MAG at 32 or 64 Hz (older units: GYRO instead of Q) | Rate differs by generation |
-| MN8 | Q0–Q3 at 6.4 Hz, fixed | No magnetometer, so turning slowly drifts; press Zero pose |
+| MN8 | Q0–Q3 at 6.4 Hz, fixed | No magnetometer, so yaw drifts (~1°/s measured); the drift fix handles it |
 | EPOC X | Q0–Q3, ACC, MAG at 32 or 64 Hz | Motion can be switched off; two band positions |
 | EPOC Flex | Not verified yet | Use the test protocol + Export log |
 
@@ -313,12 +364,14 @@ Without Q0–Q3, the head drawing and gestures are unavailable; the raw sensor b
 | *No motion samples … after 5 s* | Motion is likely switched off in the headset's configuration. Export the log anyway; it records the settings. |
 | *This headset sends no quaternion* | The unit sends gyroscope data; the bars still work. |
 | Words or the head move the wrong way | Press **Calibrate**. On EPOC X, check **Band** first. |
+| The head slowly turns while you're still | Keep **Hold yaw when still** on; give it a few still seconds to learn. |
+| A very slow deliberate turn doesn't register | That's the drift fix. Turn a little faster, or switch it off. |
 
 ## Project layout
 
 ```
 quaternion_viewer.py   the whole app: Cortex client, head-pose maths, calibration,
-                       gesture detector, session log, Tkinter UI, demo headset
+                       yaw drift fix, gesture detector, session log, Tkinter UI, demo headset
 requirements.txt       websocket-client
 docs/screenshot.png    image used in this README
 ```
