@@ -1,0 +1,10 @@
+# personal data the app writes next to itself
+head_axes.json
+logs/
+cortex-motion-log-*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
